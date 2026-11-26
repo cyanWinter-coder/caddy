@@ -71,6 +71,11 @@ func (rwc extendedConnectReadWriteCloser) SetWriteDeadline(deadline time.Time) e
 // recording the connection a websocket upgrade's round trip used.
 const upstreamConnCtxKey caddy.CtxKey = "reverse_proxy.upstream_conn"
 
+// upstreamCancelCtxKey stores the context.CancelFunc for the in-flight
+// upstream request. Canceling it promptly releases transport resources when
+// downstream forwarding fails before the client context itself is canceled.
+const upstreamCancelCtxKey caddy.CtxKey = "reverse_proxy.upstream_cancel"
+
 // upstreamWriteCloser returns where to write the close message to the
 // upstream. The write must be bounded by a deadline, but for HTTP/1
 // upgrades net/http hands the upstream socket back inside a body type that
@@ -423,6 +428,13 @@ func makeStreamLogFields(streamUUID string) []zap.Field {
 	return fields
 }
 
+// responseIsChunked reports whether the response uses chunked transfer
+// coding, considering both the parsed field and a directly constructed header.
+func responseIsChunked(res *http.Response) bool {
+	return httpguts.HeaderValuesContainsToken(res.TransferEncoding, "chunked") ||
+		httpguts.HeaderValuesContainsToken(res.Header["Transfer-Encoding"], "chunked")
+}
+
 // flushInterval returns the p.FlushInterval value, conditionally
 // overriding its value for a specific request/response.
 func (h Handler) flushInterval(req *http.Request, res *http.Response, incremental bool) time.Duration {
@@ -446,34 +458,59 @@ func (h Handler) flushInterval(req *http.Request, res *http.Response, incrementa
 		return -1
 	}
 
+	// Explicit chunked framing is also incremental even if a synthetic
+	// response carries a contradictory non-negative Content-Length.
+	if responseIsChunked(res) {
+		return -1
+	}
+
 	return time.Duration(h.FlushInterval)
 }
 
 func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInterval time.Duration, logger *zap.Logger) error {
 	var w io.Writer = dst
 
-	if flushInterval != 0 {
-		var mlwLogger *zap.Logger
-		if h.VerboseLogs {
-			mlwLogger = logger.Named("max_latency_writer")
-		} else {
-			mlwLogger = zap.NewNop()
-		}
-		mlw := &maxLatencyWriter{
-			dst: dst,
-			//nolint:bodyclose
-			flush:   http.NewResponseController(dst).Flush,
-			latency: flushInterval,
-			logger:  mlwLogger,
-		}
-		defer mlw.stop()
+	var mlw *maxLatencyWriter
+	// A zero interval still flushes each copied chunk. Positive intervals may
+	// batch chunks up to the configured latency; negative intervals flush
+	// after every write.
+	latency := flushInterval
+	if latency == 0 {
+		latency = -1
+	}
 
+	var mlwLogger *zap.Logger
+	if h.VerboseLogs {
+		mlwLogger = logger.Named("max_latency_writer")
+	} else {
+		mlwLogger = zap.NewNop()
+	}
+	mlw = &maxLatencyWriter{
+		dst: dst,
+		//nolint:bodyclose
+		flush:   http.NewResponseController(dst).Flush,
+		latency: latency,
+		logger:  mlwLogger,
+	}
+	if closer, ok := src.(io.Closer); ok {
+		// A timer-driven flush can fail while copyBuffer is blocked reading
+		// from upstream. Closing the source unblocks that read promptly.
+		mlw.onFlushError = func(error) { _ = closer.Close() }
+	}
+	defer mlw.stop()
+
+	if latency > 0 {
 		// set up initial timer so headers get flushed even if body writes are delayed
 		mlw.flushPending = true
-		mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
-
-		w = mlw
+		mlw.t = time.AfterFunc(latency, mlw.delayedFlush)
+	} else if err := mlw.flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		mlw.mu.Lock()
+		mlw.setFlushErrLocked(err)
+		mlw.mu.Unlock()
+		return fmt.Errorf("%w: flushing response headers: %w", errWritingDownstream, err)
 	}
+
+	w = mlw
 
 	buf := streamingBufPool.Get().(*[]byte)
 	defer streamingBufPool.Put(buf)
@@ -485,8 +522,16 @@ func (h Handler) copyResponse(dst http.ResponseWriter, src io.Reader, flushInter
 		copyLogger = zap.NewNop()
 	}
 
-	_, err := h.copyBuffer(w, src, *buf, copyLogger)
-	return err
+	_, copyErr := h.copyBuffer(w, src, *buf, copyLogger)
+	_ = mlw.finish()
+	if flushErr := mlw.flushError(); flushErr != nil {
+		downstreamErr := fmt.Errorf("%w: flushing response: %w", errWritingDownstream, flushErr)
+		if copyErr != nil {
+			return errors.Join(downstreamErr, copyErr)
+		}
+		return downstreamErr
+	}
+	return copyErr
 }
 
 // errWritingDownstream wraps errors from writing the response to the client,
@@ -839,28 +884,38 @@ type maxLatencyWriter struct {
 	flush   func() error
 	latency time.Duration // non-zero; negative means to flush immediately
 
-	mu           sync.Mutex // protects t, flushPending, and dst.Flush
+	mu           sync.Mutex // protects t, flushPending, flushErr, and dst.Flush
 	t            *time.Timer
 	flushPending bool
+	flushErr     error
+	onFlushError func(error)
 	logger       *zap.Logger
 }
 
 func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.flushErr != nil {
+		return 0, m.flushErr
+	}
 	n, err = m.dst.Write(p)
 	if c := m.logger.Check(zapcore.DebugLevel, "wrote bytes"); c != nil {
 		c.Write(zap.Int("n", n), zap.Error(err))
 	}
+	if err != nil {
+		return n, err
+	}
 	if m.latency < 0 {
 		m.logger.Debug("flushing immediately")
-		//nolint:errcheck
-		m.flush()
-		return n, err
+		if flushErr := m.flush(); flushErr != nil && !errors.Is(flushErr, http.ErrNotSupported) {
+			m.setFlushErrLocked(flushErr)
+			return n, flushErr
+		}
+		return n, nil
 	}
 	if m.flushPending {
 		m.logger.Debug("delayed flush already pending")
-		return n, err
+		return n, nil
 	}
 	if m.t == nil {
 		m.t = time.AfterFunc(m.latency, m.delayedFlush)
@@ -871,7 +926,7 @@ func (m *maxLatencyWriter) Write(p []byte) (n int, err error) {
 		c.Write(zap.Duration("duration", m.latency))
 	}
 	m.flushPending = true
-	return n, err
+	return n, nil
 }
 
 func (m *maxLatencyWriter) delayedFlush() {
@@ -882,9 +937,52 @@ func (m *maxLatencyWriter) delayedFlush() {
 		return
 	}
 	m.logger.Debug("delayed flush")
-	//nolint:errcheck
-	m.flush()
+	if err := m.flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		m.setFlushErrLocked(err)
+	}
 	m.flushPending = false
+}
+
+// setFlushErrLocked records the first terminal flush error and invokes the
+// failure callback. The caller must hold m.mu.
+func (m *maxLatencyWriter) setFlushErrLocked(err error) {
+	if m.flushErr == nil {
+		m.flushErr = err
+	}
+	if m.onFlushError != nil {
+		m.onFlushError(err)
+	}
+}
+
+// flushError returns the first terminal flush error, if any. It synchronizes
+// with an in-progress timer flush by acquiring the same mutex held across
+// flush calls.
+func (m *maxLatencyWriter) flushError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.flushErr
+}
+
+// finish stops delayed flushes and performs one final synchronous flush.
+// It is safe to call after all Write calls have completed.
+func (m *maxLatencyWriter) finish() error {
+	m.mu.Lock()
+	m.flushPending = false
+	if m.t != nil {
+		m.t.Stop()
+	}
+	flush := m.flush
+	flushErr := m.flushErr
+	m.mu.Unlock()
+
+	if flush != nil && flushErr == nil {
+		if err := flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			m.mu.Lock()
+			m.setFlushErrLocked(err)
+			m.mu.Unlock()
+		}
+	}
+	return m.flushError()
 }
 
 func (m *maxLatencyWriter) stop() {

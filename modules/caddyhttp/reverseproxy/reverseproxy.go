@@ -136,13 +136,12 @@ type Handler struct {
 	// backends in the first place.
 	DynamicUpstreamsRaw json.RawMessage `json:"dynamic_upstreams,omitempty" caddy:"namespace=http.reverse_proxy.upstreams inline_key=source"`
 
-	// Adjusts how often to flush the response buffer. By default,
-	// no periodic flushing is done. A negative value disables
-	// response buffering, and flushes immediately after each
-	// write to the client. This option is ignored when the upstream's
-	// response is recognized as a streaming response, or if its
-	// content length is -1; for such responses, writes are flushed
-	// to the client immediately.
+	// Adjusts how often to flush the response buffer. Copied chunks are
+	// flushed explicitly so large responses are forwarded incrementally.
+	// The zero value and negative durations flush immediately after each
+	// write; a positive duration batches writes for up to that interval.
+	// Streaming responses, chunked responses, and responses whose content
+	// length is unknown are always flushed immediately.
 	FlushInterval caddy.Duration `json:"flush_interval,omitempty"`
 
 	// A list of IP ranges (supports CIDR notation) from which
@@ -1305,7 +1304,10 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, origRe
 	// it's set before request is roundtripped to avoid a race condition when
 	// http.Transport reads a newer value to dial a new connection when that new
 	// value is updated by another reverse proxy handler, typically forward_auth.
-	ctx := context.WithValue(req.Context(), dialInfoCtxKey, di)
+	upstreamCtx, cancelUpstream := context.WithCancel(req.Context())
+	defer cancelUpstream()
+	ctx := context.WithValue(upstreamCtx, dialInfoCtxKey, di)
+	ctx = context.WithValue(ctx, upstreamCancelCtxKey, cancelUpstream)
 	// Record the upstream socket for the websocket close message, since an
 	// upgraded HTTP/1 body hides it; see upstreamWriteCloser.
 	if isWebsocket(req) {
@@ -1480,6 +1482,11 @@ func (h *Handler) finalizeResponse(
 	upstreamAddr string,
 ) error {
 	responseWasIncremental := caddyhttp.IsIncremental(res.Header)
+	// Transfer-Encoding is stripped as hop-by-hop before flushInterval runs,
+	// so retain whether the upstream explicitly used chunked framing.
+	responseWasChunked := responseIsChunked(res)
+
+	cancelUpstream, _ := req.Context().Value(upstreamCancelCtxKey).(context.CancelFunc)
 
 	// Strip hop-by-hop headers from the upstream response.
 	// For 101 Switching Protocols, save the Upgrade value
@@ -1500,6 +1507,33 @@ func (h *Handler) finalizeResponse(
 		return nil
 	}
 
+	// Response body Close implementations from custom transports are not
+	// guaranteed to be safe for concurrent or repeated use. Serialize all
+	// cancellation, flush-error, and final closes through one Once.
+	var (
+		closeBodyOnce sync.Once
+		closeBodyErr  error
+	)
+	closeBody := func() error {
+		closeBodyOnce.Do(func() {
+			closeBodyErr = res.Body.Close()
+		})
+		return closeBodyErr
+	}
+
+	// A canceled downstream context cancels the upstream request through the
+	// context used for RoundTrip. Closing the body as well also unblocks
+	// transports and test doubles whose reads do not observe context
+	// cancellation, making the connection available for transport cleanup
+	// immediately instead of after an upstream read timeout.
+	stopCloseOnClientCancel := context.AfterFunc(req.Context(), func() {
+		if cancelUpstream != nil {
+			cancelUpstream()
+		}
+		_ = closeBody()
+	})
+	defer stopCloseOnClientCancel()
+
 	// delete our Server header and use Via instead (see #6275)
 	rwHeader := rw.Header()
 	delete(rwHeader, "Server")
@@ -1518,7 +1552,7 @@ func (h *Handler) finalizeResponse(
 	}
 	if responseHasContent(req, res) && h.ResponseBuffers != 0 &&
 		(responseWasIncremental || caddyhttp.IsIncremental(res.Header)) {
-		res.Body.Close()
+		_ = closeBody()
 		return terminalError{h.refuseIncremental(rw, res.Header)}
 	}
 
@@ -1540,8 +1574,19 @@ func (h *Handler) finalizeResponse(
 		logger.Debug("wrote header")
 	}
 
-	err := h.copyResponse(rw, res.Body, h.flushInterval(req, res, responseWasIncremental), logger)
-	errClose := res.Body.Close() // close now, instead of defer, to populate res.Trailer
+	flushInterval := h.flushInterval(req, res, responseWasIncremental)
+	if responseWasChunked {
+		flushInterval = -1
+	}
+	copySrc := &readerWithCloseFunc{Reader: res.Body, closeFn: closeBody}
+	err := h.copyResponse(rw, copySrc, flushInterval, logger)
+	if err != nil && cancelUpstream != nil {
+		// A write/flush failure means the downstream consumer is gone or not
+		// reading. Cancel the upstream round trip before closing its body so
+		// the transport releases or discards the connection immediately.
+		cancelUpstream()
+	}
+	errClose := closeBody() // close now, instead of defer, to populate res.Trailer
 	if h.VerboseLogs || errClose != nil {
 		if c := logger.Check(zapcore.DebugLevel, "closed response body from upstream"); c != nil {
 			c.Write(zap.Error(errClose))
@@ -2467,6 +2512,15 @@ type StreamLogs struct {
 	// upgraded stream handshake completes and the request unwinds.
 	SkipHandshake bool `json:"skip_handshake,omitempty"`
 }
+
+// readerWithCloseFunc attaches a centralized, concurrency-safe close function
+// to a response body reader without changing the underlying concrete body.
+type readerWithCloseFunc struct {
+	io.Reader
+	closeFn func() error
+}
+
+func (r *readerWithCloseFunc) Close() error { return r.closeFn() }
 
 // bufPool is used for buffering requests and responses.
 var bufPool = sync.Pool{

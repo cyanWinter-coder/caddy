@@ -122,10 +122,14 @@ type HTTPTransport struct {
 	// The size of the read buffer in bytes. Default: `4KiB`.
 	ReadBufferSize int `json:"read_buffer_size,omitempty"`
 
-	// The maximum time to wait for next read from backend. Default: no timeout.
+	// The maximum time to wait for the next read from the backend while
+	// downloading a response. Each read resets the deadline, so this is an
+	// idle timeout rather than a cap on the total size or duration.
 	ReadTimeout caddy.Duration `json:"read_timeout,omitempty"`
 
-	// The maximum time to wait for next write to backend. Default: no timeout.
+	// The maximum time to wait for the next write to the backend while
+	// uploading a request. Each write resets the deadline, so this is an
+	// idle timeout rather than a cap on the total size or duration.
 	WriteTimeout caddy.Duration `json:"write_timeout,omitempty"`
 
 	// The versions of HTTP to support. As a special case, "h2c"
@@ -358,14 +362,33 @@ func (h *HTTPTransport) NewTransport(caddyCtx caddy.Context) (*http.Transport, e
 			}
 		}
 
-		// if read/write timeouts are configured and this is a TCP connection,
-		// enforce the timeouts by wrapping the connection with our own type
-		if tcpConn, ok := conn.(*net.TCPConn); ok && (h.ReadTimeout > 0 || h.WriteTimeout > 0) {
-			conn = &tcpRWTimeoutConn{
-				TCPConn:      tcpConn,
-				readTimeout:  time.Duration(h.ReadTimeout),
-				writeTimeout: time.Duration(h.WriteTimeout),
-				logger:       caddyCtx.Logger(),
+		// if read/write timeouts are configured, enforce them with
+		// per-operation idle deadlines. TCP connections keep their historical
+		// concrete wrapper; other stream connections (notably Unix sockets)
+		// use the generic wrapper.
+		if h.ReadTimeout > 0 || h.WriteTimeout > 0 {
+			switch c := conn.(type) {
+			case *net.TCPConn:
+				conn = &tcpRWTimeoutConn{
+					TCPConn:      c,
+					readTimeout:  time.Duration(h.ReadTimeout),
+					writeTimeout: time.Duration(h.WriteTimeout),
+					logger:       caddyCtx.Logger(),
+				}
+			case *net.UnixConn:
+				conn = &unixRWTimeoutConn{
+					UnixConn:     c,
+					readTimeout:  time.Duration(h.ReadTimeout),
+					writeTimeout: time.Duration(h.WriteTimeout),
+					logger:       caddyCtx.Logger(),
+				}
+			default:
+				conn = &rwTimeoutConn{
+					Conn:         conn,
+					readTimeout:  time.Duration(h.ReadTimeout),
+					writeTimeout: time.Duration(h.WriteTimeout),
+					logger:       caddyCtx.Logger(),
+				}
 			}
 		}
 
@@ -964,6 +987,70 @@ func (c *tcpRWTimeoutConn) Write(b []byte) (int, error) {
 		}
 	}
 	return c.TCPConn.Write(b)
+}
+
+// unixRWTimeoutConn mirrors tcpRWTimeoutConn while retaining *net.UnixConn's
+// optional methods such as CloseWrite.
+type unixRWTimeoutConn struct {
+	*net.UnixConn
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	logger       *zap.Logger
+}
+
+func (c *unixRWTimeoutConn) Read(b []byte) (int, error) {
+	if c.readTimeout > 0 {
+		if err := c.UnixConn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+	return c.UnixConn.Read(b)
+}
+
+func (c *unixRWTimeoutConn) Write(b []byte) (int, error) {
+	if c.writeTimeout > 0 {
+		if err := c.UnixConn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+	return c.UnixConn.Write(b)
+}
+
+// rwTimeoutConn is the net.Conn equivalent of tcpRWTimeoutConn. Resetting the
+// deadline before each operation makes the configured durations idle timeouts:
+// a steadily progressing large upload or download is not killed merely because
+// its total transfer time exceeds the per-read or per-write duration.
+type rwTimeoutConn struct {
+	net.Conn
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+	logger       *zap.Logger
+}
+
+func (c *rwTimeoutConn) Read(b []byte) (int, error) {
+	if c.readTimeout > 0 {
+		if err := c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout)); err != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set read deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *rwTimeoutConn) Write(b []byte) (int, error) {
+	if c.writeTimeout > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			if ce := c.logger.Check(zapcore.ErrorLevel, "failed to set write deadline"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+	}
+	return c.Conn.Write(b)
 }
 
 // decodeBase64DERCert base64-decodes, then DER-decodes, certStr.

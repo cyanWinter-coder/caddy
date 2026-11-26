@@ -1054,6 +1054,9 @@ func (h *Handler) FinalizeUnmarshalCaddyfile(helper httpcaddyfile.Helper) error 
 //	    dial_timeout            <duration>
 //	    dial_fallback_delay     <duration>
 //	    response_header_timeout <duration>
+//	    read_timeout|download_timeout <duration>
+//	    write_timeout|upload_timeout <duration>
+//	    idle_timeout|keepalive_idle_timeout <duration>
 //	    expect_continue_timeout <duration>
 //	    resolvers               <resolvers...>
 //	    tls
@@ -1100,7 +1103,7 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.WriteBufferSize = int(size)
 
-		case "read_timeout":
+		case "read_timeout", "download_timeout":
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
@@ -1110,7 +1113,7 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.ReadTimeout = caddy.Duration(timeout)
 
-		case "write_timeout":
+		case "write_timeout", "upload_timeout":
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
@@ -1307,6 +1310,19 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if len(h.TLS.ExceptPorts) == 0 {
 				return d.ArgErr()
 			}
+
+		case "idle_timeout", "keepalive_idle_timeout":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad idle timeout duration value '%s': %v", d.Val(), err)
+			}
+			if h.KeepAlive == nil {
+				h.KeepAlive = new(KeepAlive)
+			}
+			h.KeepAlive.IdleConnTimeout = caddy.Duration(dur)
 
 		case "keepalive":
 			if !d.NextArg() {
