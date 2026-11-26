@@ -17,116 +17,127 @@ package caddyfile
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 type adjacency map[string][]string
 
+// importGraph tracks the import relationships between files and snippets while
+// a Caddyfile is parsed. Nodes identify a physical file, or a snippet scoped to
+// a file ("file:snippet"); edges point from an importing node to the nodes it
+// imports.
+//
+// The graph is append-only: nodes and edges are never removed. Cycle detection
+// does not rely on reconstructing reachability from a graph that may be rolled
+// back, which previously let shared (diamond) imports corrupt the graph and
+// disable detection, turning a cyclic import into unbounded recursion and a
+// stack overflow. An edge that would close a cycle is rejected before it is
+// recorded, leaving prior edges intact, so a later expansion site can still
+// reuse the same nodes safely. A separate expansion-count budget in the parser
+// (defaultMaxImportExpansions) bounds total work even if detection were
+// bypassed.
 type importGraph struct {
 	nodes map[string]struct{}
 	edges adjacency
 }
 
+// addNode records name as a graph node. It is a no-op if name already exists.
 func (i *importGraph) addNode(name string) {
 	if i.nodes == nil {
 		i.nodes = make(map[string]struct{})
 	}
-	if _, exists := i.nodes[name]; exists {
-		return
-	}
 	i.nodes[name] = struct{}{}
 }
 
+// addNodes records every name as a graph node.
 func (i *importGraph) addNodes(names []string) {
 	for _, name := range names {
 		i.addNode(name)
 	}
 }
 
-func (i *importGraph) removeNode(name string) {
-	delete(i.nodes, name)
-	delete(i.edges, name)
-	for k, targets := range i.edges {
-		i.edges[k] = slices.DeleteFunc(targets, func(t string) bool { return t == name })
-	}
-}
-
-func (i *importGraph) removeNodes(names []string) {
-	for _, name := range names {
-		i.removeNode(name)
-	}
-}
-
+// addEdge records a directed edge from -> to. Both nodes must already be
+// registered. A duplicate edge is ignored. An edge that would close a cycle
+// (to is reachable from from, including from == to) is rejected with an error
+// and the graph is left untouched, so callers never need to roll back.
 func (i *importGraph) addEdge(from, to string) error {
 	if !i.exists(from) || !i.exists(to) {
 		return fmt.Errorf("one of the nodes does not exist")
 	}
 
-	if i.willCycle(to, from) {
-		return fmt.Errorf("a cycle of imports exists between %s and %s", from, to)
-	}
-
 	if i.areConnected(from, to) {
-		// if connected, there's nothing to do
+		// already recorded; nothing to do
 		return nil
 	}
 
-	if i.nodes == nil {
-		i.nodes = make(map[string]struct{})
+	if path, cycles := i.reaches(to, from); cycles {
+		return fmt.Errorf("a cycle of imports exists: %s", strings.Join(append(path, to), " -> "))
 	}
+
 	if i.edges == nil {
 		i.edges = make(adjacency)
 	}
-
 	i.edges[from] = append(i.edges[from], to)
 	return nil
 }
 
+// addEdges records directed edges from each entry in tos back to from. If any
+// edge would create a cycle, the error is returned and the graph retains only
+// the edges recorded before the failing one; nothing is deleted.
 func (i *importGraph) addEdges(from string, tos []string) error {
 	for _, to := range tos {
-		err := i.addEdge(from, to)
-		if err != nil {
+		if err := i.addEdge(from, to); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// areConnected reports whether a direct edge from -> to already exists.
 func (i *importGraph) areConnected(from, to string) bool {
-	al, ok := i.edges[from]
-	if !ok {
-		return false
-	}
-	return slices.Contains(al, to)
+	return slices.Contains(i.edges[from], to)
 }
 
-func (i *importGraph) willCycle(from, to string) bool {
-	if from == to {
-		return true
+// reaches performs a depth-first search starting at from and reports whether
+// target is reachable. On a hit it also returns the node path from from to
+// target (inclusive), useful for rendering a readable cycle. The search is
+// iterative so a long acyclic import chain cannot itself overflow the stack.
+func (i *importGraph) reaches(from, target string) ([]string, bool) {
+	if from == target {
+		return []string{from}, true
 	}
-	collector := make(map[string]bool)
+	type frame struct {
+		node string
+		next int
+	}
+	visited := map[string]bool{from: true}
+	stack := []frame{{node: from}}
+	path := []string{from}
 
-	var visit func(string)
-	visit = func(start string) {
-		if !collector[start] {
-			collector[start] = true
-			for _, v := range i.edges[start] {
-				visit(v)
-			}
+	for len(stack) > 0 {
+		fr := &stack[len(stack)-1]
+		neighbors := i.edges[fr.node]
+		if fr.next >= len(neighbors) {
+			stack = stack[:len(stack)-1]
+			path = path[:len(path)-1]
+			continue
 		}
-	}
-
-	for _, v := range i.edges[from] {
-		visit(v)
-	}
-	for k := range collector {
-		if to == k {
-			return true
+		neighbor := neighbors[fr.next]
+		fr.next++
+		if visited[neighbor] {
+			continue
 		}
+		if neighbor == target {
+			return append(path, target), true
+		}
+		visited[neighbor] = true
+		stack = append(stack, frame{node: neighbor})
+		path = append(path, neighbor)
 	}
-
-	return false
+	return nil, false
 }
 
+// exists reports whether key is a registered node.
 func (i *importGraph) exists(key string) bool {
 	_, exists := i.nodes[key]
 	return exists

@@ -69,6 +69,8 @@ func discoverImportedFileContents(rootFile string, rootInput []byte, rootInfo os
 			nodes: make(map[string]struct{}),
 			edges: make(adjacency),
 		},
+		importExpansions:    new(int),
+		maxImportExpansions: defaultMaxImportExpansions,
 	}
 	p.importObserver = func(path string, info os.FileInfo, content []byte, ancestry *importAncestor) (bool, error) {
 		for ancestor := ancestry; ancestor != nil; ancestor = ancestor.parent {

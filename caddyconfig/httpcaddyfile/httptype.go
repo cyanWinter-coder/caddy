@@ -142,11 +142,15 @@ func (st ServerType) Setup(
 			dirFunc, ok := registeredDirectives[dir]
 			if !ok {
 				tkn := segment[0]
-				message := "%s:%d: unrecognized directive: %s"
+				// Distinguish an unregistered directive from an argument error in a
+				// recognized one: the typed error lets callers classify the failure
+				// while the position points at the offending token in its source file.
+				unkErr := &caddyfile.UnknownDirectiveError{Directive: dir}
+				pe := caddyfile.NewParseError(caddyfile.KindUnknownDirective, tkn, unkErr)
 				if !sb.block.HasBraces {
-					message += "\nDid you mean to define a second site? If so, you must use curly braces around each site to separate their configurations."
+					return nil, warnings, fmt.Errorf("%w\nDid you mean to define a second site? If so, you must use curly braces around each site to separate their configurations.", pe)
 				}
-				return nil, warnings, fmt.Errorf(message, tkn.File, tkn.Line, dir)
+				return nil, warnings, pe
 			}
 
 			h := Helper{
@@ -162,7 +166,9 @@ func (st ServerType) Setup(
 
 			results, err := dirFunc(h)
 			if err != nil {
-				return nil, warnings, fmt.Errorf("parsing caddyfile tokens for '%s': %v", dir, err)
+				// Wrap with %w so an underlying *caddyfile.ParseError keeps its
+				// kind and source position and can be inspected by callers.
+				return nil, warnings, fmt.Errorf("parsing caddyfile tokens for '%s': %w", dir, err)
 			}
 
 			dir = normalizeDirectiveName(dir)
@@ -396,7 +402,8 @@ func (ServerType) evaluateGlobalOptionsBlock(serverBlocks []serverBlock, options
 		optFunc, ok := registeredGlobalOptions[opt]
 		if !ok {
 			tkn := segment[0]
-			return nil, fmt.Errorf("%s:%d: unrecognized global option: %s", tkn.File, tkn.Line, opt)
+			return nil, caddyfile.NewParseError(caddyfile.KindUnknownDirective, tkn,
+				&caddyfile.UnknownDirectiveError{Directive: opt})
 		}
 
 		val, err = optFunc(disp, options[opt])

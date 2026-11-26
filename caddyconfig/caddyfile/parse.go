@@ -45,7 +45,10 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 
 	tokens, err := allTokens(filename, inputCopy)
 	if err != nil {
-		return nil, err
+		// Lexer errors carry a line number in their message but not a position
+		// structure; wrap them at the start of the file so callers see a
+		// consistent *ParseError type. The token has no import chain yet.
+		return nil, NewParseError(KindSyntax, Token{File: filename}, err)
 	}
 	p := parser{
 		Dispenser: NewDispenser(tokens),
@@ -53,8 +56,17 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 			nodes: make(map[string]struct{}),
 			edges: make(adjacency),
 		},
+		importExpansions:    new(int),
+		maxImportExpansions: defaultMaxImportExpansions,
 	}
-	return p.parseAll()
+	blocks, err := p.parseAll()
+	if err != nil {
+		// Never return partially assembled server blocks alongside an error:
+		// adaptation is all-or-nothing, so a failure cannot leave callers with
+		// a half-expanded configuration.
+		return nil, err
+	}
+	return blocks, nil
 }
 
 // allTokens lexes the entire input, but does not parse it.
@@ -117,13 +129,26 @@ type importAncestor struct {
 	parent *importAncestor
 }
 
+// defaultMaxImportExpansions caps the total number of import expansions during
+// one parse. Imports are expanded inline by splicing tokens into a single
+// stream rather than through one stack frame per level, so a runaway or cyclic
+// import that graph detection somehow misses manifests as unbounded expansion
+// of the token stream, not unbounded call depth. Counting expansions therefore
+// gives a hard, bounded guarantee: reaching the budget returns a positioned
+// error instead of looping (or, on recursive snippet paths) overflowing the
+// stack. It is a variable rather than a constant so tests can exercise the
+// guard with a small budget.
+var defaultMaxImportExpansions = 10000
+
 type parser struct {
 	*Dispenser
-	block           ServerBlock // current server block being parsed
-	eof             bool        // if we encounter a valid EOF in a hard place
-	definedSnippets map[string][]Token
-	nesting         int
-	importGraph     importGraph
+	block               ServerBlock // current server block being parsed
+	eof                 bool        // if we encounter a valid EOF in a hard place
+	definedSnippets     map[string][]Token
+	nesting             int
+	importGraph         importGraph
+	importExpansions    *int
+	maxImportExpansions int
 	// importObserver, when set, runs after an imported file is opened and read but
 	// before its tokens are inserted. Returning true skips token insertion. This
 	// internal hook lets FormatImports observe the parser's actual import execution
@@ -439,6 +464,27 @@ func (p *parser) doImport(nesting int) error {
 	var importedTokens []Token
 	var nodes []string
 
+	// the node doing the importing: the current file, namespaced by snippet
+	// when the import site lives inside a snippet definition
+	nodeName := p.File()
+	if p.Token().snippetName != "" {
+		nodeName += fmt.Sprintf(":%s", p.Token().snippetName)
+	}
+	p.importGraph.addNode(nodeName)
+
+	// hard guard against runaway expansion regardless of graph state
+	if p.importExpansions == nil {
+		p.importExpansions = new(int)
+	}
+	budget := p.maxImportExpansions
+	if budget == 0 {
+		budget = defaultMaxImportExpansions
+	}
+	if *p.importExpansions >= budget {
+		return p.WrapErr(NewParseError(KindImport, p.Token(),
+			fmt.Errorf("import expansion limit of %d exceeded while importing %s; check for an import cycle", budget, importPattern)))
+	}
+
 	// first check snippets. That is a simple, non-recursive replacement
 	if p.definedSnippets != nil && p.definedSnippets[importPattern] != nil {
 		importedTokens = p.definedSnippets[importPattern]
@@ -452,7 +498,7 @@ func (p *parser) doImport(nesting int) error {
 		// list of matching filenames
 		matches, globPattern, err := resolveImportGlob(p.Dispenser.File(), importPattern)
 		if err != nil {
-			return p.WrapErr(err)
+			return p.WrapErr(NewParseError(KindImport, p.Token(), err))
 		}
 		if len(matches) == 0 {
 			if strings.ContainsAny(globPattern, "*?[]") {
@@ -464,9 +510,11 @@ func (p *parser) doImport(nesting int) error {
 				// the same as a missing file. Stat the path directly
 				// so the real error is reported instead (issue #8161).
 				if _, err := os.Stat(globPattern); err != nil && !os.IsNotExist(err) {
-					return p.Errf("Failed to import file %s: %v", importPattern, err)
+					return p.WrapErr(NewParseError(KindImport, p.Token(),
+						fmt.Errorf("Failed to import file %s: %v", importPattern, err)))
 				}
-				return p.Errf("File to import not found: %s", importPattern)
+				return p.WrapErr(NewParseError(KindImport, p.Token(),
+					fmt.Errorf("File to import not found: %s", importPattern)))
 			}
 		}
 
@@ -481,16 +529,19 @@ func (p *parser) doImport(nesting int) error {
 		nodes = matches
 	}
 
-	nodeName := p.File()
-	if p.Token().snippetName != "" {
-		nodeName += fmt.Sprintf(":%s", p.Token().snippetName)
-	}
-	p.importGraph.addNode(nodeName)
 	p.importGraph.addNodes(nodes)
+
+	// Record every edge before expanding. The graph is append-only: an edge
+	// that closes a cycle is rejected without mutating anything, so unlike the
+	// previous removeNodes-based rollback this can never delete nodes or edges
+	// still referenced by another (diamond) import path. Repeated imports of
+	// the same file or snippet remain legal: their edges already exist and
+	// addEdges is a no-op for them, so only genuine cycles are rejected.
 	if err := p.importGraph.addEdges(nodeName, nodes); err != nil {
-		p.importGraph.removeNodes(nodes)
-		return err
+		return p.WrapErr(NewParseError(KindImport, p.Token(), err))
 	}
+
+	*p.importExpansions++
 
 	// copy the tokens so we don't overwrite p.definedSnippets
 	tokensCopy := make([]Token, 0, len(importedTokens))
@@ -613,11 +664,14 @@ func (p *parser) expandImportsInBlock(tokens []Token) ([]Token, error) {
 	// Create a temporary parser that operates on the provided tokens.
 	// The Dispenser is initialized with the token slice; snippets and the
 	// import graph are shared so that imports and cycle detection work
-	// consistently across the whole Caddyfile.
+	// consistently across the whole Caddyfile. The expansion counter is shared
+	// by pointer so the global budget applies to named-route imports too.
 	tempParser := &parser{
-		Dispenser:       NewDispenser(tokens),
-		definedSnippets: p.definedSnippets,
-		importGraph:     p.importGraph,
+		Dispenser:           NewDispenser(tokens),
+		definedSnippets:     p.definedSnippets,
+		importGraph:         p.importGraph,
+		importExpansions:    p.importExpansions,
+		maxImportExpansions: p.maxImportExpansions,
 		// Carry the observer so callers watching import execution (such as
 		// FormatImports) also see files imported from inside a named route.
 		importObserver: p.importObserver,
@@ -644,23 +698,27 @@ func (p *parser) expandImportsInBlock(tokens []Token) ([]Token, error) {
 // doSingleImport lexes the individual file at importFile and returns
 // its tokens or an error, if any.
 func (p *parser) doSingleImport(importFile string) ([]Token, error) {
+	importErr := func(err error) error {
+		return NewParseError(KindImport, p.Token(), err)
+	}
+
 	file, err := os.Open(importFile)
 	if err != nil {
-		return nil, p.Errf("Could not import %s: %v", importFile, err)
+		return nil, importErr(fmt.Errorf("Could not import %s: %v", importFile, err))
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return nil, p.Errf("Could not import %s: %v", importFile, err)
+		return nil, importErr(fmt.Errorf("Could not import %s: %v", importFile, err))
 	}
 	if info.IsDir() {
-		return nil, p.Errf("Could not import %s: is a directory", importFile)
+		return nil, importErr(fmt.Errorf("Could not import %s: is a directory", importFile))
 	}
 
 	input, err := io.ReadAll(file)
 	if err != nil {
-		return nil, p.Errf("Could not read imported file %s: %v", importFile, err)
+		return nil, importErr(fmt.Errorf("Could not read imported file %s: %v", importFile, err))
 	}
 	// Notify only after a successful read so observers receive bytes and metadata
 	// from the same open descriptor. A skipped cyclic import contributes no
@@ -668,7 +726,7 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 	if p.importObserver != nil {
 		skip, err := p.importObserver(importFile, info, input, p.Token().importAncestry)
 		if err != nil {
-			return nil, p.Errf("Could not import %s: %v", importFile, err)
+			return nil, importErr(fmt.Errorf("Could not import %s: %v", importFile, err))
 		}
 		if skip {
 			return nil, nil
@@ -683,14 +741,14 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 
 	importedTokens, err := allTokens(importFile, input)
 	if err != nil {
-		return nil, p.Errf("Could not read tokens while importing %s: %v", importFile, err)
+		return nil, importErr(fmt.Errorf("Could not read tokens while importing %s: %v", importFile, err))
 	}
 
 	// Tack the file path onto these tokens so errors show the imported file's name
 	// (we use full, absolute path to avoid bugs: issue #1892)
 	filename, err := caddy.FastAbs(importFile)
 	if err != nil {
-		return nil, p.Errf("Failed to get absolute path of file: %s: %v", importFile, err)
+		return nil, importErr(fmt.Errorf("Failed to get absolute path of file: %s: %v", importFile, err))
 	}
 	var ancestry *importAncestor
 	if p.importObserver != nil {

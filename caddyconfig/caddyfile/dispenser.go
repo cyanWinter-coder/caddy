@@ -20,7 +20,6 @@ import (
 	"io"
 	"log"
 	"strconv"
-	"strings"
 )
 
 // Dispenser is a type that dispenses tokens, similarly to a lexer,
@@ -420,8 +419,8 @@ func (d *Dispenser) ArgErr() error {
 // SyntaxErr creates a generic syntax error which explains what was
 // found and what was expected.
 func (d *Dispenser) SyntaxErr(expected string) error {
-	msg := fmt.Sprintf("syntax error: unexpected token '%s', expecting '%s', at %s:%d import chain: ['%s']", d.Val(), expected, d.File(), d.Line(), strings.Join(d.Token().imports, "','"))
-	return errors.New(msg)
+	msg := fmt.Sprintf("syntax error: unexpected token '%s', expecting '%s'", d.Val(), expected)
+	return d.WrapErr(NewParseError(KindSyntax, d.Token(), errors.New(msg)))
 }
 
 // EOFErr returns an error indicating that the dispenser reached
@@ -441,11 +440,14 @@ func (d *Dispenser) Errf(format string, args ...any) error {
 }
 
 // WrapErr takes an existing error and adds the Caddyfile file and line number.
+// If err is already a *ParseError it is returned unchanged so positions are not
+// wrapped twice; otherwise it is classified as an argument error at the
+// current token.
 func (d *Dispenser) WrapErr(err error) error {
-	if len(d.Token().imports) > 0 {
-		return fmt.Errorf("%w, at %s:%d import chain ['%s']", err, d.File(), d.Line(), strings.Join(d.Token().imports, "','"))
+	if _, ok := AsParseError(err); ok {
+		return err
 	}
-	return fmt.Errorf("%w, at %s:%d", err, d.File(), d.Line())
+	return NewParseError(KindArgument, d.Token(), err)
 }
 
 // Delete deletes the current token and returns the updated slice

@@ -1240,5 +1240,9 @@ func TestResolveImportGlob(t *testing.T) {
 }
 
 func testParser(input string) parser {
-	return parser{Dispenser: NewTestDispenser(input)}
+	return parser{
+		Dispenser:           NewTestDispenser(input),
+		importExpansions:    new(int),
+		maxImportExpansions: defaultMaxImportExpansions,
+	}
 }

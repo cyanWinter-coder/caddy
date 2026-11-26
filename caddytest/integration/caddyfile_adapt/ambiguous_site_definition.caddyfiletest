@@ -8,5 +8,5 @@ handle {
 	respond "two"
 }
 ----------
-Caddyfile:6: unrecognized directive: example.com
+unrecognized directive: example.com, at Caddyfile:6
 Did you mean to define a second site? If so, you must use curly braces around each site to separate their configurations.
